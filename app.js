@@ -29,7 +29,7 @@ function secondaryAuth() {
 const S = {
   phase: 'loading', // loading | login | setup | app | inactive
   me: null, email: '', isAdmin: false, profile: null,
-  config: { name: 'WASU', start: '08:30', end: '17:30', grace: 10 },
+  config: { name: 'WASU', start: '08:30', end: '17:30', grace: 10, method: 'gps', loc: null, radius: 20 },
   presence: null, today: null, todayKey: dayKey(Date.now()),
   secret: null, secretLoaded: false,
   att: [], attLoaded: false, users: [], usersLoaded: false,
@@ -129,7 +129,7 @@ async function verifyPending() {
   if (!S.isAdmin || !S.secret) return;
   for (const a of S.att) {
     const la = a.lastAction;
-    if (!la || !la.key) continue;
+    if (!la || !la.key || !la.code) continue;
     if (a.lastCheck && a.lastCheck.key === la.key) continue;
     const k = a.id + '|' + la.key;
     if (verifying.has(k)) continue;
@@ -157,7 +157,70 @@ function errMsg(e) {
   if (c === 'unavailable') return 'Mất kết nối mạng. Kiểm tra Wi-Fi/4G rồi thử lại.';
   return (e && e.message) || 'Không lưu được, thử lại.';
 }
-async function doAction(kind, code, retry) {
+// ---------- định vị ----------
+const method = () => S.config.method || 'gps';
+const usesGps = () => method() === 'gps' || method() === 'both';
+const usesCode = () => method() === 'code' || method() === 'both';
+function distM(a, b) {
+  const R = 6371000, rad = x => x * Math.PI / 180;
+  const dLat = rad(b.lat - a.lat), dLng = rad(b.lng - a.lng);
+  const h = Math.sin(dLat / 2) ** 2 + Math.cos(rad(a.lat)) * Math.cos(rad(b.lat)) * Math.sin(dLng / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(h));
+}
+const fmtDist = m => m >= 1000 ? (m / 1000).toFixed(1).replace('.', ',') + ' km' : Math.round(m) + ' m';
+function geoOk(g) {
+  const loc = S.config.loc; if (!g || !loc) return false;
+  const r = Number(S.config.radius) || 20;
+  return distM(g, loc) <= r + Math.min(Number(g.acc) || 0, 30);
+}
+function getPosition() {
+  return new Promise((resolve, reject) => {
+    if (!navigator.geolocation) return reject({ code: 'nogeo' });
+    navigator.geolocation.getCurrentPosition(
+      p => resolve({ lat: p.coords.latitude, lng: p.coords.longitude, acc: Math.round(p.coords.accuracy || 0) }),
+      e => reject(e), { enableHighAccuracy: true, timeout: 20000, maximumAge: 0 });
+  });
+}
+function parseLoc(text) {
+  const t = String(text || '');
+  const pats = [/!3d(-?\d+(?:\.\d+)?)!4d(-?\d+(?:\.\d+)?)/, /@(-?\d+(?:\.\d+)?),\s*(-?\d+(?:\.\d+)?)/, /[?&](?:q|query|ll|destination)=(-?\d+(?:\.\d+)?),\s*(-?\d+(?:\.\d+)?)/, /(-?\d{1,2}\.\d{3,})\s*,\s*(-?\d{1,3}\.\d{3,})/];
+  for (const re of pats) { const m = t.match(re); if (m) { const lat = +m[1], lng = +m[2]; if (Math.abs(lat) <= 90 && Math.abs(lng) <= 180) return { lat, lng }; } }
+  return null;
+}
+function geoModal(html) {
+  document.getElementById('modal').innerHTML = `<div class="modal-bg" data-close><div class="sheet">${html}</div></div>`;
+  bindModalClose();
+}
+async function startCheck(kind, retry) {
+  if (!usesGps()) return openCodeModal(kind, retry, null);
+  if (!S.config.loc) { toast('Quản lý chưa cài đặt vị trí quán. Vui lòng báo quản lý.', true); return; }
+  geoModal(`<div style="text-align:center;padding:16px 0"><div style="font-size:34px">📍</div><b style="font-size:17px">Đang xác định vị trí…</b><p class="muted" style="margin:6px 0 0;font-size:13.5px">Nếu điện thoại hỏi quyền vị trí, hãy chọn <b>Cho phép</b>.</p></div>`);
+  let g;
+  try { g = await getPosition(); }
+  catch (e) {
+    const denied = e && e.code === 1;
+    geoModal(`<div class="row"><b style="font-size:17px">Không lấy được vị trí</b><button class="btn small" data-close-btn>Đóng</button></div>
+      <p class="ink2" style="font-size:14px">${denied
+        ? 'Bạn đã chặn quyền vị trí cho trang này. <br>• <b>iPhone</b>: Cài đặt → Quyền riêng tư & Bảo mật → Dịch vụ định vị → bật cho Safari (Khi dùng ứng dụng), rồi mở lại app.<br>• <b>Android</b>: bấm biểu tượng ổ khóa cạnh địa chỉ → Quyền → Vị trí → Cho phép.'
+        : 'Hãy bật định vị (GPS) trên điện thoại, đứng chỗ thoáng hoặc bật Wi-Fi để định vị nhanh hơn, rồi thử lại.'}</p>
+      <button class="bigbtn in" data-geo-retry>Thử lại</button>`);
+    document.querySelector('[data-geo-retry]').onclick = () => startCheck(kind, retry);
+    return;
+  }
+  const d = distM(g, S.config.loc); g.d = Math.round(d);
+  if (!geoOk(g)) {
+    geoModal(`<div class="row"><b style="font-size:17px">Bạn chưa ở ${esc(S.config.name)}</b><button class="btn small" data-close-btn>Đóng</button></div>
+      <p class="ink2" style="font-size:14px">Vị trí của bạn cách quán khoảng <b>${fmtDist(d)}</b> (cho phép trong ${Number(S.config.radius) || 20} m).
+      ${g.acc > 30 ? `<br>GPS đang kém chính xác (±${g.acc} m) — hãy bật Wi-Fi, ra gần cửa hoặc chờ vài giây rồi thử lại.` : ''}</p>
+      <button class="bigbtn in" data-geo-retry>Thử lại</button>`);
+    document.querySelector('[data-geo-retry]').onclick = () => startCheck(kind, retry);
+    return;
+  }
+  if (usesCode()) return openCodeModal(kind, retry, g);
+  doAction(kind, null, retry, g);
+}
+
+async function doAction(kind, code, retry, geo) {
   if (S.busy || !S.me) return;
   S.busy = true; closeModal(); render();
   try {
@@ -168,12 +231,12 @@ async function doAction(kind, code, retry) {
     d.date = dk; d.sessions = d.sessions || [];
     const ss = d.sessions, last = ss[ss.length - 1];
     if (kind === 'in') {
-      if (last && !last.out) { last.in = t; last.inCode = code; }
-      else ss.push({ in: t, inCode: code, out: null, outCode: null });
+      if (last && !last.out) { last.in = t; last.inCode = code; last.inGeo = geo || null; }
+      else ss.push({ in: t, inCode: code, inGeo: geo || null, out: null, outCode: null, outGeo: null });
     } else {
       if (!last) throw new Error('Chưa có lượt check-in hôm nay.');
       if (last.out && !retry) throw new Error('Bạn đã check-out rồi.');
-      last.out = t; last.outCode = code;
+      last.out = t; last.outCode = code; last.outGeo = geo || null;
     }
     d.updatedAt = t;
     await setDoc(dayRef, d);
@@ -183,7 +246,7 @@ async function doAction(kind, code, retry) {
       status: kind === 'in' ? 'in' : 'out',
       since: kind === 'in' ? ss[idx].in : t,
       date: dk, todayClosedMs: closed, firstIn: ss[0].in, sessions: ss.length,
-      lastAction: { key: `${dk}#${idx}#${kind}#${t}`, kind, t, code, day: dk, idx },
+      lastAction: { key: `${dk}#${idx}#${kind}#${t}`, kind, t, code: code || null, geo: geo || null, method: method(), day: dk, idx },
       updatedAt: t,
     }, { merge: true });
     toast(kind === 'in' ? `Đã check-in lúc ${hm(t)}` : `Đã check-out lúc ${hm(t)}`);
@@ -191,7 +254,7 @@ async function doAction(kind, code, retry) {
   finally { S.busy = false; render(); }
 }
 
-function openCodeModal(kind, retry) {
+function openCodeModal(kind, retry, geo) {
   const title = kind === 'in' ? 'Check-in vào làm' : 'Check-out ra về';
   const m = document.getElementById('modal');
   m.innerHTML = `
@@ -213,7 +276,7 @@ function openCodeModal(kind, retry) {
     e.preventDefault();
     const v = inp.value.trim();
     if (!/^\d{6}$/.test(v)) { document.getElementById('codeErr').textContent = 'Mã gồm đúng 6 chữ số.'; return; }
-    doAction(kind, v, retry);
+    doAction(kind, v, retry, geo);
   });
 }
 function bindModalClose() {
@@ -244,7 +307,7 @@ const IC = {
 const LABEL = { home: 'Chấm công', history: 'Lịch sử', live: 'Trực tiếp', report: 'Báo cáo', staff: 'Nhân viên', kiosk: 'Màn hình mã', settings: 'Cài đặt' };
 
 function navHTML() {
-  const list = S.isAdmin ? ['home', 'live', 'report', 'staff', 'kiosk', 'settings'] : ['home', 'history'];
+  const list = S.isAdmin ? ['home', 'live', 'report', 'staff', ...(usesCode() ? ['kiosk'] : []), 'settings'] : ['home', 'history'];
   return `<nav class="tabs"><div class="in">${list.map(v => `<a href="#${v}" class="${S.view === v ? 'on' : ''}">${IC[v]}<span>${LABEL[v]}</span></a>`).join('')}</div></nav>`;
 }
 function topHTML() {
@@ -364,7 +427,9 @@ function homeHTML() {
     <div>${st.open ? '<span class="pill green" style="background:rgba(91,211,154,.16);color:#7BE3B2"><span class="dot pulse"></span>Đang làm việc</span>' : (st.ss.length ? '<span class="pill gray" style="background:rgba(255,255,255,.1);color:#D5DED9">Đã ra về</span>' : '<span class="pill gray" style="background:rgba(255,255,255,.1);color:#D5DED9">Chưa check-in</span>')}</div></div></div>`;
   if (forgot) h += `<div class="notice amber">⚠️ Ngày ${esc(p.date.split('-').reverse().join('/'))} bạn chưa check-out. Ca đó sẽ ghi là <b>thiếu giờ ra</b> — báo quản lý nếu cần điều chỉnh.</div>`;
   const la = p && p.lastAction, lc = p && p.lastCheck;
-  if (la && la.day === S.todayKey) {
+  if (la && la.day === S.todayKey && !la.code && la.geo) {
+    if (Date.now() - la.t < 15 * 60000) h += `<div class="notice green">📍 Vị trí hợp lệ — lượt ${la.kind === 'in' ? 'check-in' : 'check-out'} lúc ${hm(la.t)}, cách quán ${fmtDist(la.geo.d || 0)}.</div>`;
+  } else if (la && la.day === S.todayKey && la.code) {
     if (lc && lc.key === la.key) {
       if (lc.ok) { if (Date.now() - la.t < 15 * 60000) h += `<div class="notice green">✅ Mã hợp lệ — lượt ${la.kind === 'in' ? 'check-in' : 'check-out'} lúc ${hm(la.t)} đã được xác thực.</div>`; }
       else h += `<div class="notice red"><div style="flex:1">❌ Mã của lượt ${la.kind === 'in' ? 'check-in' : 'check-out'} lúc ${hm(la.t)} <b>không khớp</b> (sai số hoặc mã đã hết hạn).<div style="margin-top:8px"><button class="btn small" data-retry="${la.kind}">Nhập lại mã</button></div></div></div>`;
@@ -380,7 +445,7 @@ function homeHTML() {
   h += `<div class="card"><div class="grid2">
     <div class="stat"><div class="k">Giờ vào đầu tiên</div><div class="v mono">${hm(st.firstIn)}</div>${st.late ? `<span class="pill amber" style="margin-top:6px">Muộn ${st.late} phút</span>` : (st.firstIn ? '<span class="pill green" style="margin-top:6px">Đúng giờ</span>' : '')}</div>
     <div class="stat"><div class="k">Giờ ra gần nhất</div><div class="v mono">${st.open ? '—' : hm(st.lastOut)}</div>${st.early ? `<span class="pill amber" style="margin-top:6px">Về sớm ${st.early} phút</span>` : ''}</div>
-  </div><p class="muted" style="margin:12px 0 0;font-size:13px">Ca làm: ${esc(S.config.start)} – ${esc(S.config.end)} · cho phép muộn ${Number(S.config.grace) || 0} phút</p></div>`;
+  </div><p class="muted" style="margin:12px 0 0;font-size:13px">Ca làm: ${esc(S.config.start)} – ${esc(S.config.end)} · cho phép muộn ${Number(S.config.grace) || 0} phút${usesGps() ? ` · chấm công trong bán kính ${Number(S.config.radius) || 20} m quanh quán` : ''}</p></div>`;
   h += `<div class="card"><h3>Các lượt trong ngày</h3>`;
   if (!st.ss.length) h += `<p class="muted" style="margin:0">Chưa có lượt nào. Bấm <b>Check-in</b> khi bạn đến nơi làm việc.</p>`;
   st.ss.forEach((s, i) => {
@@ -439,7 +504,8 @@ function liveHTML() {
   });
   const nIn = list.filter(x => x.inNow).length, nOut = list.filter(x => x.todayRec && !x.inNow).length, nNone = list.filter(x => !x.todayRec).length, nLate = list.filter(x => x.late).length;
   let h = '';
-  if (!S.secret) h += `<div class="notice amber">Chưa có màn hình mã. Vào tab <b>Màn hình mã</b> để tạo mã và bật trên máy tính bảng/TV tại nơi làm việc — nhân viên cần mã này để chấm công.</div>`;
+  if (usesGps() && !S.config.loc) h += `<div class="notice amber">Chưa cài vị trí quán. Vào tab <b>Cài đặt</b> để nhập vị trí — nhân viên chỉ chấm công được khi ở trong bán kính quanh vị trí này.</div>`;
+  if (usesCode() && !S.secret) h += `<div class="notice amber">Chưa có màn hình mã. Vào tab <b>Màn hình mã</b> để tạo mã và bật trên máy tính bảng/TV tại nơi làm việc — nhân viên cần mã này để chấm công.</div>`;
   h += `<div class="card"><div class="grid2" style="grid-template-columns:repeat(4,1fr)">
     <div class="stat"><div class="k">Đang làm việc</div><div class="v" style="color:var(--green)">${nIn}</div></div>
     <div class="stat"><div class="k">Đã về</div><div class="v">${nOut}</div></div>
@@ -458,7 +524,7 @@ function liveHTML() {
       : `<span class="pill gray">Chưa check-in</span>`;
     const worked = todayRec ? (a.todayClosedMs || 0) + (inNow ? now - a.since : 0) : 0;
     const la = a.lastAction, lc = a.lastCheck;
-    const ver = !todayRec || !la ? '' : (lc && lc.key === la.key ? (lc.ok ? '<span class="pill green">✓ Hợp lệ</span>' : '<span class="pill red">✗ Sai mã</span>') : '<span class="pill blue">Đang đối chiếu</span>');
+    const ver = !todayRec || !la ? '' : (!la.code && la.geo) ? `<span class="pill green">📍 ${fmtDist(la.geo.d || 0)}</span>` : (lc && lc.key === la.key ? (lc.ok ? '<span class="pill green">✓ Hợp lệ</span>' : '<span class="pill red">✗ Sai mã</span>') : '<span class="pill blue">Đang đối chiếu</span>');
     h += `<tr><td><div class="emp"><div class="av ${inNow ? 'in' : ''}">${esc(initials(n))}</div><b>${esc(n)}</b></div></td>
       <td>${status}</td><td class="mono">${todayRec ? hm(a.firstIn) : '—'} ${late ? `<span class="pill amber">+${late}p</span>` : ''}</td>
       <td class="mono" ${inNow ? `data-live-base="${a.todayClosedMs || 0}" data-live-since="${a.since}"` : ''}>${todayRec ? durClock(worked) : '—'}</td><td>${ver}</td></tr>`;
@@ -472,17 +538,17 @@ function reportHTML() {
   let h = `<div class="card"><div class="row" style="flex-wrap:wrap"><h3 style="margin:0">Báo cáo chấm công theo tháng</h3>
     <div style="display:flex;gap:8px;flex-wrap:wrap"><input type="month" class="inp" style="width:auto;padding:7px 10px" id="repMonth" value="${R.month}">
     <button class="btn" id="repCopy" ${R.data ? '' : 'disabled'}>Sao chép CSV</button></div></div>
-    <p class="muted" style="margin:10px 0 0;font-size:12.5px">Giờ thực tế = tổng các lượt có đủ giờ vào và giờ ra. Cột "Mã không hợp lệ" đối chiếu lại mã của từng lượt với thời điểm chấm.</p></div>`;
+    <p class="muted" style="margin:10px 0 0;font-size:12.5px">Giờ thực tế = tổng các lượt có đủ giờ vào và giờ ra. Cột "Không hợp lệ" kiểm tra lại vị trí GPS (hoặc mã) của từng lượt chấm.</p></div>`;
   if (R.loading || !R.data) return h + `<div class="skel">${R.loading ? 'Đang tổng hợp…' : ''}</div>`;
   if (!R.data.length) return h + `<div class="card muted">Không có dữ liệu chấm công trong tháng này.</div>`;
-  h += `<div class="card"><h3>Tổng hợp theo nhân viên</h3><div class="tscroll"><table><thead><tr><th>Nhân viên</th><th>Số ngày</th><th>Tổng giờ</th><th>TB/ngày</th><th>Đi muộn</th><th>Về sớm</th><th>Thiếu giờ ra</th><th>Mã không hợp lệ</th><th></th></tr></thead><tbody>`;
+  h += `<div class="card"><h3>Tổng hợp theo nhân viên</h3><div class="tscroll"><table><thead><tr><th>Nhân viên</th><th>Số ngày</th><th>Tổng giờ</th><th>TB/ngày</th><th>Đi muộn</th><th>Về sớm</th><th>Thiếu giờ ra</th><th>Không hợp lệ</th><th></th></tr></thead><tbody>`;
   R.data.forEach(e => {
     const days = e.rows.length, tot = e.rows.reduce((a, r) => a + r.st.worked, 0);
     const late = e.rows.filter(r => r.st.late).length, early = e.rows.filter(r => r.st.early).length, miss = e.rows.filter(r => r.st.missingOut).length;
     const bad = e.rows.reduce((a, r) => a + (r.v ? r.v.bad : 0), 0), n = nameOf(e.id);
     h += `<tr><td><div class="emp"><div class="av">${esc(initials(n))}</div><b>${esc(n)}</b></div></td><td>${days}</td><td class="mono">${dur(tot)}</td><td class="mono">${days ? dur(tot / days) : '—'}</td>
       <td>${late ? `<span class="pill amber">${late}</span>` : '0'}</td><td>${early ? `<span class="pill amber">${early}</span>` : '0'}</td><td>${miss ? `<span class="pill red">${miss}</span>` : '0'}</td>
-      <td>${S.secret ? (bad ? `<span class="pill red">${bad} lượt</span>` : '<span class="pill green">0</span>') : '—'}</td>
+      <td>${bad ? `<span class="pill red">${bad} lượt</span>` : '<span class="pill green">0</span>'}</td>
       <td><button class="btn small" data-open="${esc(e.id)}">${R.open === e.id ? 'Ẩn' : 'Chi tiết'}</button></td></tr>`;
     if (R.open === e.id) {
       h += `<tr><td colspan="9" style="background:#FAF9F5"><table><thead><tr><th>Ngày</th><th>Vào</th><th>Ra</th><th>Số lượt</th><th>Thực tế</th><th>Ghi chú</th></tr></thead><tbody>`;
@@ -491,7 +557,8 @@ function reportHTML() {
         if (r.st.late) notes.push(`<span class="pill amber">Muộn ${r.st.late}p</span>`);
         if (r.st.early) notes.push(`<span class="pill amber">Sớm ${r.st.early}p</span>`);
         if (r.st.missingOut) notes.push('<span class="pill red">Thiếu giờ ra</span>');
-        if (r.v && r.v.bad) notes.push(`<span class="pill red">${r.v.bad} mã sai</span>`);
+        if (r.v && r.v.bad) notes.push(`<span class="pill red">${r.v.bad} lượt không hợp lệ</span>`);
+        if (r.st.ss[0] && r.st.ss[0].inGeo) notes.push(`<span class="pill gray">📍 ${fmtDist(r.st.ss[0].inGeo.d || 0)}</span>`);
         h += `<tr><td>${esc(_fShort.format(new Date(r.d.date + 'T12:00:00+07:00')))}</td><td class="mono">${hm(r.st.firstIn)}</td><td class="mono">${r.st.open ? 'đang làm' : hm(r.st.lastOut)}</td><td>${r.st.ss.length}</td><td class="mono">${dur(r.st.worked)}</td><td>${notes.join(' ')}</td></tr>`;
       });
       h += `</tbody></table></td></tr>`;
@@ -514,10 +581,10 @@ async function loadReport() {
   R.loading = false; render();
 }
 function reportCSV() {
-  const lines = [['Nhân viên', 'Email', 'Ngày', 'Giờ vào', 'Giờ ra', 'Số lượt', 'Giờ thực tế', 'Đi muộn (phút)', 'Về sớm (phút)', 'Thiếu giờ ra', 'Mã không hợp lệ']];
+  const lines = [['Nhân viên', 'Email', 'Ngày', 'Giờ vào', 'Giờ ra', 'Số lượt', 'Giờ thực tế', 'Đi muộn (phút)', 'Về sớm (phút)', 'Thiếu giờ ra', 'Lượt không hợp lệ', 'Khoảng cách lúc vào (m)']];
   (S.report.data || []).forEach(e => e.rows.forEach(r => lines.push([
     nameOf(e.id), userOf(e.id)?.email || '', r.d.date, hm(r.st.firstIn), r.st.open ? '' : hm(r.st.lastOut), r.st.ss.length, hours(r.st.worked).replace('.', ','),
-    r.st.late, r.st.early, r.st.missingOut ? 'Có' : '', r.v ? r.v.bad : '',
+    r.st.late, r.st.early, r.st.missingOut ? 'Có' : '', r.v ? r.v.bad : '', r.st.ss[0] && r.st.ss[0].inGeo ? r.st.ss[0].inGeo.d : '',
   ])));
   return '﻿' + lines.map(l => l.map(c => { const s = String(c ?? ''); return /[",;\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s; }).join(',')).join('\n');
 }
@@ -536,12 +603,16 @@ function dayStats(d, now = Date.now()) {
   const early = !open && lastOut && minOfDay(lastOut) < en ? en - minOfDay(lastOut) : 0;
   return { ss, worked, open, missingOut, firstIn, lastOut, late, early };
 }
+function verifyOne(code, geo, t) {
+  if (code) return S.secret ? verifyCode(S.secret, code, t) : true;
+  if (geo) return geoOk(geo);
+  return false;
+}
 function verifyDay(d) {
-  if (!S.secret) return null;
   let bad = 0, total = 0;
   (d.sessions || []).forEach(s => {
-    total++; if (!verifyCode(S.secret, s.inCode, s.in)) bad++;
-    if (s.out) { total++; if (!verifyCode(S.secret, s.outCode, s.out)) bad++; }
+    total++; if (!verifyOne(s.inCode, s.inGeo, s.in)) bad++;
+    if (s.out) { total++; if (!verifyOne(s.outCode, s.outGeo, s.out)) bad++; }
   });
   return { bad, total };
 }
@@ -616,12 +687,26 @@ function settingsHTML() {
     <div class="grid2"><div><label class="f">Giờ bắt đầu</label><input class="inp" type="time" name="start" value="${esc(c.start)}" required></div>
     <div><label class="f">Giờ kết thúc</label><input class="inp" type="time" name="end" value="${esc(c.end)}" required></div></div>
     <label class="f">Cho phép đi muộn (phút)</label><input class="inp" type="number" name="grace" min="0" max="120" value="${Number(c.grace) || 0}">
+    <label class="f">Cách xác nhận có mặt</label>
+    <select class="inp" name="method">
+      <option value="gps" ${method() === 'gps' ? 'selected' : ''}>Định vị GPS (không cần mã)</option>
+      <option value="both" ${method() === 'both' ? 'selected' : ''}>GPS + mã 6 số trên màn hình (chặt nhất)</option>
+      <option value="code" ${method() === 'code' ? 'selected' : ''}>Chỉ mã 6 số trên màn hình</option>
+    </select>
+    <label class="f">Vị trí quán (dán link Google Maps hoặc toạ độ "vĩ độ, kinh độ")</label>
+    <input class="inp" name="loc" id="locIn" value="${c.loc ? c.loc.lat + ', ' + c.loc.lng : ''}" placeholder="21.30896, 105.60412">
+    <div style="display:flex;gap:8px;align-items:center;margin-top:8px;flex-wrap:wrap">
+      <button type="button" class="btn small" id="locHere">📍 Lấy vị trí tôi đang đứng</button>
+      ${c.loc ? `<a class="muted" style="font-size:13px" target="_blank" rel="noopener" href="https://www.google.com/maps?q=${c.loc.lat},${c.loc.lng}">Xem trên Google Maps</a>` : ''}
+    </div>
+    <label class="f">Bán kính cho phép (mét)</label><input class="inp" type="number" name="radius" min="10" max="1000" value="${Number(c.radius) || 20}">
+    <p class="muted" style="font-size:12.5px;margin:6px 0 0">GPS điện thoại trong nhà thường lệch 10–40 m; app cộng thêm tối đa 30 m theo sai số GPS. Nếu nhân viên hay bị báo "chưa ở quán" dù đang ở quán, hãy tăng bán kính lên 50 m.</p>
     <button class="btn primary" style="margin-top:16px;width:100%;padding:12px" type="submit">Lưu cài đặt</button></form>
     <div class="card"><h3>Hướng dẫn triển khai</h3><ol class="ink2" style="margin:0;padding-left:20px;font-size:14px">
-      <li style="margin-bottom:6px">Mở tab <b>Màn hình mã</b> trên máy tính bảng/TV đặt tại nơi làm việc (đăng nhập tài khoản quản lý), để màn hình luôn sáng.</li>
+      <li style="margin-bottom:6px">Chế độ GPS: nhập vị trí quán ở trên (hoặc đứng tại quán bấm "Lấy vị trí tôi đang đứng"). Nếu dùng mã: mở tab <b>Màn hình mã</b> trên máy tính bảng/TV tại quán.</li>
       <li style="margin-bottom:6px">Vào tab <b>Nhân viên</b> tạo tài khoản cho từng người, gửi họ email + mật khẩu và đường link app.</li>
       <li style="margin-bottom:6px">Nhân viên mở link trên điện thoại → iPhone: Safari → Chia sẻ → <b>Thêm vào MH chính</b>; Android: Chrome → ⋮ → <b>Thêm vào màn hình chính</b>.</li>
-      <li>Mỗi lần đến/về, nhân viên bấm Check-in/Check-out và nhập mã 6 số trên màn hình.</li></ol></div>`;
+      <li>Mỗi lần đến/về, nhân viên bấm Check-in/Check-out; app kiểm tra vị trí (và mã nếu bật).</li></ol></div>`;
 }
 
 // ---------- gắn sự kiện ----------
@@ -630,8 +715,8 @@ function bindCommon() {
 }
 function bindView() {
   bindCommon();
-  document.querySelectorAll('[data-act]').forEach(b => b.onclick = () => openCodeModal(b.dataset.act, false));
-  document.querySelectorAll('[data-retry]').forEach(b => b.onclick = () => openCodeModal(b.dataset.retry, true));
+  document.querySelectorAll('[data-act]').forEach(b => b.onclick = () => startCheck(b.dataset.act, false));
+  document.querySelectorAll('[data-retry]').forEach(b => b.onclick = () => startCheck(b.dataset.retry, true));
   const hmEl = document.getElementById('histMonth');
   if (hmEl) { hmEl.onchange = () => { S.history.month = hmEl.value || monthNow(); loadHistory(); }; if (!S.history.rows && !S.history.loading) loadHistory(); }
   const rm = document.getElementById('repMonth');
@@ -648,8 +733,21 @@ function bindView() {
   if (f) f.onsubmit = async e => {
     e.preventDefault();
     const fd = new FormData(f);
-    const cfg = { name: String(fd.get('name')).trim() || 'WASU', start: fd.get('start'), end: fd.get('end'), grace: Math.max(0, Math.min(120, Number(fd.get('grace')) || 0)) };
+    const locText = String(fd.get('loc') || '').trim();
+    const loc = locText ? parseLoc(locText) : null;
+    if (locText && !loc) { toast('Không đọc được vị trí. Hãy dán toạ độ dạng "21.30896, 105.60412" hoặc link Google Maps đầy đủ.', true); return; }
+    const m = String(fd.get('method') || 'gps');
+    if (m !== 'code' && !loc) { toast('Chế độ GPS cần nhập vị trí quán.', true); return; }
+    const cfg = { name: String(fd.get('name')).trim() || 'WASU', start: fd.get('start'), end: fd.get('end'), grace: Math.max(0, Math.min(120, Number(fd.get('grace')) || 0)),
+      method: m, loc, radius: Math.max(10, Math.min(1000, Number(fd.get('radius')) || 20)) };
     try { await setDoc(doc(fs, 'config/office'), cfg); document.activeElement?.blur(); toast('Đã lưu cài đặt'); } catch { toast('Không lưu được cài đặt', true); }
+  };
+  const lh = document.getElementById('locHere');
+  if (lh) lh.onclick = async () => {
+    lh.disabled = true; lh.textContent = 'Đang lấy vị trí…';
+    try { const g = await getPosition(); document.getElementById('locIn').value = `${g.lat.toFixed(6)}, ${g.lng.toFixed(6)}`; toast(`Đã lấy vị trí (sai số ±${g.acc} m). Bấm "Lưu cài đặt" để áp dụng.`); }
+    catch { toast('Không lấy được vị trí. Hãy cho phép quyền vị trí cho trang này.', true); }
+    lh.disabled = false; lh.textContent = '📍 Lấy vị trí tôi đang đứng';
   };
   const af = document.getElementById('addUserForm');
   if (af) af.onsubmit = e => { e.preventDefault(); addUser(af); };
