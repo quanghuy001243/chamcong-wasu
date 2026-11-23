@@ -1,0 +1,63 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() { return request.auth != null; }
+    function isAdmin() { return signedIn() && exists(/databases/$(database)/documents/admins/$(request.auth.uid)); }
+    function isActive() {
+      return signedIn()
+        && exists(/databases/$(database)/documents/users/$(request.auth.uid))
+        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.active == true;
+    }
+    function bootstrapOpen() { return !exists(/databases/$(database)/documents/meta/bootstrap); }
+    function freshTime() {
+      return request.resource.data.updatedAt is int
+        && request.resource.data.updatedAt > request.time.toMillis() - 180000
+        && request.resource.data.updatedAt < request.time.toMillis() + 180000;
+    }
+
+    // Thiết lập quản trị viên đầu tiên (chỉ một lần)
+    match /meta/bootstrap {
+      allow read: if true;
+      allow create: if signedIn() && bootstrapOpen()
+        && existsAfter(/databases/$(database)/documents/admins/$(request.auth.uid));
+    }
+    match /admins/{uid} {
+      allow read: if signedIn() && (request.auth.uid == uid || isAdmin());
+      allow create: if signedIn() && request.auth.uid == uid && bootstrapOpen()
+        && existsAfter(/databases/$(database)/documents/meta/bootstrap);
+      allow write: if isAdmin();
+    }
+
+    match /config/{docId} {
+      allow read: if signedIn();
+      allow write: if isAdmin();
+    }
+    match /secure/{docId} {
+      allow read, write: if isAdmin();
+    }
+    match /users/{uid} {
+      allow read: if signedIn() && (request.auth.uid == uid || isAdmin());
+      allow write: if isAdmin();
+      allow create: if signedIn() && request.auth.uid == uid && bootstrapOpen()
+        && existsAfter(/databases/$(database)/documents/meta/bootstrap);
+    }
+
+    // Trạng thái hiện tại của từng nhân viên
+    match /att/{uid} {
+      allow read: if signedIn() && (request.auth.uid == uid || isAdmin());
+      allow write: if isAdmin();
+      allow create: if signedIn() && request.auth.uid == uid && isActive() && freshTime()
+        && !('lastCheck' in request.resource.data);
+      allow update: if signedIn() && request.auth.uid == uid && isActive() && freshTime()
+        && !request.resource.data.diff(resource.data).affectedKeys().hasAny(['lastCheck']);
+
+      // Ngày công
+      match /days/{day} {
+        allow read: if signedIn() && (request.auth.uid == uid || isAdmin());
+        allow write: if isAdmin();
+        allow create, update: if signedIn() && request.auth.uid == uid && isActive() && freshTime()
+          && request.resource.data.date == day;
+      }
+    }
+  }
+}
